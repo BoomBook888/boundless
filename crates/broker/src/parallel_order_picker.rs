@@ -168,7 +168,7 @@ where
                         &order
                     ).await {
                         Ok(true) => {
-                            tracing::info!("成功锁定订单: 0x{:x}", request_id);
+                            tracing::trace!("！！！成功锁定订单！！！: 0x{:x}", request_id);
                         }
                         Ok(false) => {
                             tracing::debug!("订单已被锁定: 0x{:x}", request_id);
@@ -205,12 +205,12 @@ where
     let request_id = order.request.id;
     
     // 直接尝试锁定订单，不进行任何预检查
-    // 获取Gas价格配置并提高优先级
+    // 获取Gas价格配置并直接使用
     let conf_priority_gas = {
         let conf = config.lock_all()
             .context("Failed to lock config")?;
-        // 使用更高的gas价格
-        Some(conf.market.lockin_priority_gas.unwrap_or(100_000_000) * 3)
+        // 直接使用配置的值，不做额外乘法
+        conf.market.lockin_priority_gas
     };
     
     // 立即尝试锁定订单

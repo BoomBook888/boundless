@@ -202,7 +202,7 @@ where
             
             let task = tokio::spawn(async move {
                 // 首先检查订单是否已被锁定
-                match market_clone.requestIsLocked(request_id_clone).call().await {
+                match market_clone.instance().requestIsLocked(request_id_clone).call().await {
                     Ok(is_locked) => {
                         if is_locked {
                             // 订单已被锁定，跳过
@@ -211,7 +211,7 @@ where
                         }
                         
                         // 检查订单是否已被完成
-                        match market_clone.requestIsFulfilled(request_id_clone).call().await {
+                        match market_clone.is_fulfilled(request_id_clone).await {
                             Ok(is_fulfilled) => {
                                 if is_fulfilled {
                                     // 订单已被完成，跳过

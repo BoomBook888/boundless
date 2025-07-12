@@ -212,11 +212,11 @@ where
     async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
         let request_id = order.request.id;
 
-        // 使用更高优先级的gas价格
+        // 使用配置中的优先级gas价格，不再乘以3
         let conf_priority_gas = {
             let conf = self.config.lock_all().context("Failed to lock config")?;
-            // 使用更高的gas价格，提高优先级，确保在竞争环境中成功
-            Some(conf.market.lockin_priority_gas.unwrap_or(100_000_000) * 3)
+            // 直接使用配置的值，不做额外乘法
+            conf.market.lockin_priority_gas
         };
 
         tracing::info!(
