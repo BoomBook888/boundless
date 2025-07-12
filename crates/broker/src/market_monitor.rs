@@ -28,6 +28,7 @@ use crate::{
     chain_monitor::ChainMonitorService,
     db::{DbError, DbObj},
     errors::{impl_coded_debug, CodedError},
+    now_timestamp,
     task::{RetryRes, RetryTask, SupervisorErr},
     FulfillmentType, OrderRequest,
 };
@@ -135,6 +136,140 @@ where
         block_times.sort();
 
         Ok(block_times[block_times.len() / 2])
+    }
+
+    /// 获取当前链上所有未锁定的可用订单，用于并行处理
+    pub async fn get_available_orders(&self) -> Result<Vec<Box<OrderRequest>>> {
+        let current_block = self.chain_monitor.current_block_number().await?;
+        let chain_id = self.provider.get_chain_id().await.context("Failed to get chain id")?;
+        
+        // 减小查询范围，只查询最近的区块
+        let start_block = current_block.saturating_sub(50); // 只查询最近50个区块
+        
+        tracing::debug!("查询可用订单：区块范围 {start_block} - {current_block}");
+        
+        let market = BoundlessMarketService::new(
+            self.market_addr, 
+            self.provider.clone(), 
+            Address::ZERO
+        );
+        
+        // 创建过滤器以获取RequestSubmitted事件
+        let filter = Filter::new()
+            .event_signature(IBoundlessMarket::RequestSubmitted::SIGNATURE_HASH)
+            .from_block(start_block)
+            .address(self.market_addr);
+
+        // 获取日志
+        let logs = self.provider.get_logs(&filter).await.context("Failed to get logs")?;
+        let decoded_logs = logs.iter().filter_map(|log| {
+            match log.log_decode::<IBoundlessMarket::RequestSubmitted>() {
+                Ok(res) => Some((res, log.block_number.unwrap_or_default())),
+                Err(err) => {
+                    tracing::error!("Failed to decode RequestSubmitted log: {err:?}");
+                    None
+                }
+            }
+        });
+
+        // 按区块号排序，优先处理最新的订单
+        let mut sorted_logs: Vec<_> = decoded_logs.collect();
+        sorted_logs.sort_by(|a, b| b.1.cmp(&a.1)); // 按区块号降序排序
+
+        // 处理日志并创建订单请求，限制最大订单数量
+        let mut orders = Vec::new();
+        let current_timestamp = now_timestamp();
+        let max_orders = 20; // 最多处理20个订单
+        
+        // 使用并行处理提高效率
+        let mut tasks = Vec::with_capacity(sorted_logs.len().min(max_orders * 2));
+        
+        for (log, _) in sorted_logs.iter().take(max_orders * 3) { // 获取更多候选订单，因为有些可能会被过滤
+            let event = &log.inner.data;
+            let request_id = U256::from(event.requestId);
+            
+            // 检查订单是否太旧
+            if current_timestamp - event.request.offer.biddingStart > 60 {
+                // 跳过超过60秒的旧订单
+                continue;
+            }
+            
+            // 创建并行任务获取订单信息和检查订单状态
+            let market_clone = market.clone();
+            let request_id_clone = request_id;
+            let market_addr = self.market_addr;
+            let chain_id = chain_id;
+            
+            let task = tokio::spawn(async move {
+                // 首先检查订单是否已被锁定
+                match market_clone.requestIsLocked(request_id_clone).call().await {
+                    Ok(is_locked) => {
+                        if is_locked {
+                            // 订单已被锁定，跳过
+                            tracing::debug!("跳过已锁定的订单 0x{:x}", request_id_clone);
+                            return None;
+                        }
+                        
+                        // 检查订单是否已被完成
+                        match market_clone.requestIsFulfilled(request_id_clone).call().await {
+                            Ok(is_fulfilled) => {
+                                if is_fulfilled {
+                                    // 订单已被完成，跳过
+                                    tracing::debug!("跳过已完成的订单 0x{:x}", request_id_clone);
+                                    return None;
+                                }
+                                
+                                // 获取订单详细信息
+                                match market_clone.get_submitted_request(request_id_clone, None).await {
+                                    Ok((request, client_sig)) => {
+                                        // 创建订单请求对象
+                                        Some(Box::new(crate::OrderRequest::new(
+                                            request,
+                                            client_sig,
+                                            crate::FulfillmentType::LockAndFulfill,
+                                            market_addr,
+                                            chain_id,
+                                        )))
+                                    }
+                                    Err(err) => {
+                                        tracing::debug!("获取订单信息失败 0x{:x}: {}", request_id_clone, err);
+                                        None
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!("检查订单完成状态失败 0x{:x}: {}", request_id_clone, err);
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("检查订单锁定状态失败 0x{:x}: {}", request_id_clone, err);
+                        None
+                    }
+                }
+            });
+            
+            tasks.push(task);
+            
+            if tasks.len() >= max_orders * 2 {
+                break;
+            }
+        }
+        
+        // 等待所有任务完成并收集结果
+        for task in tasks {
+            if let Ok(Some(order)) = task.await {
+                orders.push(order);
+                
+                if orders.len() >= max_orders {
+                    break;
+                }
+            }
+        }
+
+        tracing::info!("找到 {} 个可用订单", orders.len());
+        Ok(orders)
     }
 
     async fn find_open_orders(

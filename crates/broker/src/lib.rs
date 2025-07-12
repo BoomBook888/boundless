@@ -47,6 +47,7 @@ pub(crate) mod market_monitor;
 pub(crate) mod offchain_market_monitor;
 pub(crate) mod order_monitor;
 pub(crate) mod order_picker;
+pub(crate) mod parallel_order_picker;
 pub(crate) mod prioritization;
 pub(crate) mod provers;
 pub(crate) mod proving;
@@ -172,7 +173,7 @@ fn format_order_id(
 /// Order request from the network.
 ///
 /// This will turn into an [`Order`] once it is locked or skipped.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct OrderRequest {
     request: ProofRequest,
     client_sig: Bytes,
@@ -667,6 +668,9 @@ where
             fulfillment_tx.clone(),
         ));
 
+        // 提前克隆market_monitor，以便后续使用
+        let market_monitor_for_parallel = market_monitor.clone();
+
         let block_times =
             market_monitor.get_block_time().await.context("Failed to sample block times")?;
 
@@ -725,6 +729,8 @@ where
             Arc::new(provers::DefaultProver::new())
         };
 
+        // 创建两个通道，用于订单处理
+        let (_new_order_tx, _new_order_rx): (mpsc::Sender<Box<OrderRequest>>, mpsc::Receiver<Box<OrderRequest>>) = mpsc::channel(NEW_ORDER_CHANNEL_CAPACITY);
         let (pricing_tx, pricing_rx) = mpsc::channel(PRICING_CHANNEL_CAPACITY);
 
         let stake_token_decimals = BoundlessMarketService::new(
@@ -745,18 +751,35 @@ where
             self.provider.clone(),
             chain_monitor.clone(),
             new_order_rx,
-            pricing_tx,
+            pricing_tx.clone(), // 在这里克隆
             stake_token_decimals,
         ));
-        let cloned_config = config.clone();
-        let cancel_token = non_critical_cancel_token.clone();
-        supervisor_tasks.spawn(async move {
-            Supervisor::new(order_picker, cloned_config, cancel_token)
-                .spawn()
-                .await
-                .context("Failed to start order picker")?;
-            Ok(())
-        });
+        
+        // 获取并发级别配置
+        let concurrency_level = {
+            let conf = self.config_watcher.config.lock_all()?;
+            // 使用更高的并发度，至少8个并发线程
+            conf.market.parallel_order_concurrency.unwrap_or(8).max(8) as usize
+        };
+        
+        // 为并行订单处理器创建新的变量
+        let parallel_cancel_token = critical_cancel_token.clone();
+        let parallel_order_picker = Arc::new(parallel_order_picker::ParallelOrderPicker::new(
+            self.db.clone(),
+            self.config_watcher.config.clone(),
+            self.provider.clone(),
+            chain_monitor.clone(),
+            self.deployment().boundless_market_address,
+            pricing_tx.clone(),
+            order_picker.clone(), // 使用克隆的Arc
+            market_monitor_for_parallel, // 使用提前克隆的Arc
+            concurrency_level,
+        ));
+        
+        tracing::info!("启动高并发订单获取器，并发级别: {}", concurrency_level);
+        
+        // 启动并行订单获取器
+        parallel_order_picker.start(parallel_cancel_token).await?;
 
         let proving_service = Arc::new(
             proving::ProvingService::new(

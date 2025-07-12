@@ -241,6 +241,11 @@ pub struct MarketConf {
     /// - "shortest_expiry": Process orders by shortest expiry first (lock expiry for lock-and-fulfill orders, request expiry for others)
     #[serde(default, alias = "expired_order_fulfillment_priority")]
     pub order_commitment_priority: OrderCommitmentPriority,
+
+    /// 并行订单处理的并发级别
+    /// 
+    /// 控制同时尝试锁定的订单数量，提高抢单成功率
+    pub parallel_order_concurrency: Option<u32>,
 }
 
 impl Default for MarketConf {
@@ -276,6 +281,7 @@ impl Default for MarketConf {
             max_concurrent_preflights: defaults::max_concurrent_preflights(),
             order_pricing_priority: OrderPricingPriority::default(),
             order_commitment_priority: OrderCommitmentPriority::default(),
+            parallel_order_concurrency: None,
         }
     }
 }

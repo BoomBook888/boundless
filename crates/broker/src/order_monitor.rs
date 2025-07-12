@@ -24,8 +24,7 @@ use alloy::{
 use anyhow::{Context, Result};
 use boundless_market::contracts::{
     boundless_market::{BoundlessMarketService, MarketError},
-    IBoundlessMarket::IBoundlessMarketErrors,
-    RequestStatus, TxnErr,
+    TxnErr,
 };
 use boundless_market::selector::SupportedSelectors;
 use moka::{future::Cache, Expiry};
@@ -42,9 +41,6 @@ const MAX_PROVING_BATCH_SIZE: u32 = 10;
 pub enum OrderMonitorErr {
     #[error("{code} Failed to lock order: {0}", code = self.code())]
     LockTxFailed(String),
-
-    #[error("{code} Failed to confirm lock tx: {0}", code = self.code())]
-    LockTxNotConfirmed(String),
 
     #[error("{code} Insufficient balance for lock", code = self.code())]
     InsufficientBalance,
@@ -64,7 +60,6 @@ impl_coded_debug!(OrderMonitorErr);
 impl CodedError for OrderMonitorErr {
     fn code(&self) -> &str {
         match self {
-            OrderMonitorErr::LockTxNotConfirmed(_) => "[B-OM-006]",
             OrderMonitorErr::LockTxFailed(_) => "[B-OM-007]",
             OrderMonitorErr::AlreadyLocked => "[B-OM-009]",
             OrderMonitorErr::InsufficientBalance => "[B-OM-010]",
@@ -127,7 +122,9 @@ struct OrderMonitorConfig {
 
 #[derive(Clone)]
 pub struct RpcRetryConfig {
+    #[allow(dead_code)]
     pub retry_count: u64,
+    #[allow(dead_code)]
     pub retry_sleep_ms: u64,
 }
 
@@ -139,11 +136,13 @@ pub struct OrderMonitor<P> {
     config: ConfigLock,
     market: BoundlessMarketService<Arc<P>>,
     provider: Arc<P>,
+    #[allow(dead_code)]
     prover_addr: Address,
     priced_order_rx: Arc<Mutex<mpsc::Receiver<Box<OrderRequest>>>>,
     lock_and_prove_cache: Arc<Cache<String, Arc<OrderRequest>>>,
     prove_cache: Arc<Cache<String, Arc<OrderRequest>>>,
     supported_selectors: SupportedSelectors,
+    #[allow(dead_code)]
     rpc_retry_config: RpcRetryConfig,
 }
 
@@ -213,120 +212,55 @@ where
     async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
         let request_id = order.request.id;
 
-        let order_status = self
-            .market
-            .get_status(request_id, Some(order.request.expires_at()))
-            .await
-            .context("Failed to get request status")?;
-        if order_status != RequestStatus::Unknown {
-            tracing::info!("Request {:x} not open: {order_status:?}, skipping", request_id);
-            // TODO: fetch some chain data to find out who / and for how much the order
-            // was locked in at
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
-
-        let is_locked = self
-            .db
-            .is_request_locked(U256::from(order.request.id))
-            .await
-            .context("Failed to check if request is locked")?;
-        if is_locked {
-            tracing::warn!("Request 0x{:x} already locked: {order_status:?}, skipping", request_id);
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
-
+        // 使用更高优先级的gas价格
         let conf_priority_gas = {
             let conf = self.config.lock_all().context("Failed to lock config")?;
-            conf.market.lockin_priority_gas
+            // 使用更高的gas价格，提高优先级，确保在竞争环境中成功
+            Some(conf.market.lockin_priority_gas.unwrap_or(100_000_000) * 3)
         };
 
         tracing::info!(
-            "Locking request: 0x{:x} for stake: {}",
+            "快速锁单: 立即锁定 0x{:x}, 出价: {}",
             request_id,
             order.request.offer.lockStake
         );
-        let lock_block = self
+        
+        // 直接尝试锁定订单，跳过前置检查
+        let _lock_block = self
             .market
             .lock_request(&order.request, order.client_sig.clone(), conf_priority_gas)
             .await
             .map_err(|e| -> OrderMonitorErr {
                 match e {
                     MarketError::TxnError(txn_err) => match txn_err {
-                        TxnErr::BoundlessMarketErr(IBoundlessMarketErrors::RequestIsLocked(_)) => {
-                            OrderMonitorErr::AlreadyLocked
-                        }
-                        _ => OrderMonitorErr::LockTxFailed(txn_err.to_string()),
-                    },
-                    MarketError::RequestAlreadyLocked(_e) => OrderMonitorErr::AlreadyLocked,
-                    MarketError::TxnConfirmationError(e) => {
-                        OrderMonitorErr::LockTxNotConfirmed(e.to_string())
-                    }
-                    MarketError::LockRevert(e) => {
-                        // Note: lock revert could be for any number of reasons;
-                        // 1/ someone may have locked in the block before us,
-                        // 2/ the lock may have expired,
-                        // 3/ the request may have been fulfilled,
-                        // 4/ the requestor may have withdrawn their funds
-                        // Currently we don't have a way to determine the cause of the revert.
-                        OrderMonitorErr::LockTxFailed(format!("Tx hash 0x{:x}", e))
-                    }
-                    MarketError::Error(e) => {
-                        // Insufficient balance error is thrown both when the requestor has insufficient balance,
-                        // Requestor having insufficient balance can happen and is out of our control. The prover
-                        // having insufficient balance is unexpected as we should have checked for that before
-                        // committing to locking the order.
-                        let prover_addr_str =
-                            self.prover_addr.to_string().to_lowercase().replace("0x", "");
-                        if e.to_string().contains("InsufficientBalance") {
-                            if e.to_string().to_lowercase().contains(&prover_addr_str) {
+                        TxnErr::ContractErr(data) => {
+                            if data.to_string().contains("RequestIsLocked") {
+                                OrderMonitorErr::AlreadyLocked
+                            } else if data.to_string().contains("InsufficientBalance") {
                                 OrderMonitorErr::InsufficientBalance
                             } else {
-                                OrderMonitorErr::LockTxFailed(format!(
-                                    "Requestor has insufficient balance at lock time: {}",
-                                    e
-                                ))
+                                OrderMonitorErr::LockTxFailed(format!("Contract error: {}", data))
                             }
-                        } else if e.to_string().contains("RequestIsLocked") {
-                            OrderMonitorErr::AlreadyLocked
-                        } else {
-                            OrderMonitorErr::UnexpectedError(e)
                         }
-                    }
-                    _ => {
-                        if e.to_string().contains("RequestIsLocked") {
-                            OrderMonitorErr::AlreadyLocked
-                        } else {
-                            OrderMonitorErr::UnexpectedError(e.into())
-                        }
-                    }
+                        _ => OrderMonitorErr::LockTxFailed(format!("Transaction error: {}", txn_err)),
+                    },
+                    _ => OrderMonitorErr::RpcErr(anyhow::anyhow!(e)),
                 }
             })?;
 
-        // Fetch the block to retrieve the lock timestamp. This has been observed to return
-        // inconsistent state between the receipt being available but the block not yet.
-        let lock_timestamp = crate::futures_retry::retry(
-            self.rpc_retry_config.retry_count,
-            self.rpc_retry_config.retry_sleep_ms,
-            || async {
-                Ok(self
-                    .provider
-                    .get_block_by_number(lock_block.into())
-                    .await
-                    .with_context(|| format!("failed to get block {lock_block}"))?
-                    .with_context(|| format!("failed to get block {lock_block}: block not found"))?
-                    .header
-                    .timestamp)
-            },
-            "get_block_by_number",
-        )
-        .await
-        .map_err(OrderMonitorErr::UnexpectedError)?;
-
+        let current_block = self.chain_monitor.current_block_number().await?;
         let lock_price = order
             .request
             .offer
-            .price_at(lock_timestamp)
+            .price_at(self.chain_monitor.current_chain_head().await?.block_timestamp)
             .context("Failed to calculate lock price")?;
+
+        tracing::info!(
+            "成功锁定订单 0x{:x} 价格: {} 区块: {}",
+            request_id,
+            format_ether(lock_price),
+            current_block
+        );
 
         Ok(lock_price)
     }
