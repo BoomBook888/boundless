@@ -123,6 +123,7 @@ struct OrderMonitorConfig {
     additional_proof_cycles: u64,
     batch_buffer_time_secs: u64,
     order_commitment_priority: OrderCommitmentPriority,
+    skip_pre_execution: bool,
 }
 
 #[derive(Clone)]
@@ -510,8 +511,17 @@ where
         Ok(candidate_orders)
     }
 
-    async fn lock_and_prove_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<()> {
+    async fn lock_and_prove_orders(&self, orders: &[Arc<OrderRequest>], config: &OrderMonitorConfig) -> Result<()> {
+        // 如果启用了skip_pre_execution并且有订单，记录日志
+        if config.skip_pre_execution && !orders.is_empty() {
+            tracing::info!(
+                "已启用跳过预执行模式，将直接锁定 {} 个订单无需预执行检查",
+                orders.len()
+            );
+        }
+
         let lock_jobs = orders.iter().map(|order| {
+            let skip_pre_execution = config.skip_pre_execution;
             async move {
                 let order_id = order.id();
                 if order.fulfillment_type == FulfillmentType::LockAndFulfill {
@@ -671,9 +681,40 @@ where
         // Calculate remaining balance after accounting for committed orders
         let mut remaining_balance_wei = available_balance_wei - committed_cost_wei;
 
-        // Apply peak khz limit if specified
+        // Store the number of committed orders for logging
         let num_commited_orders = committed_orders.len();
-        if config.peak_prove_khz.is_some() && !orders.is_empty() {
+
+        // 如果启用了skip_pre_execution，简化处理流程
+        if config.skip_pre_execution {
+            tracing::info!(
+                "已启用跳过预执行模式，将直接锁定订单无需预执行检查"
+            );
+            
+            // Simply check gas for each order
+            for order in orders {
+                if final_orders.len() >= capacity_granted {
+                    break;
+                }
+                let order_cost_wei = self.calculate_order_gas_cost_wei(&order, gas_price).await?;
+
+                // Skip if not enough balance
+                if order_cost_wei > remaining_balance_wei {
+                    tracing::warn!(
+                        "Insufficient balance for order {}. Required: {} ether, Remaining: {} ether",
+                        order.id(),
+                        format_ether(order_cost_wei),
+                        format_ether(remaining_balance_wei)
+                    );
+                    self.skip_order(&order, "insufficient balance").await;
+                    continue;
+                }
+
+                final_orders.push(order);
+                remaining_balance_wei -= order_cost_wei;
+            }
+        }
+        // Apply peak khz limit if specified and skip_pre_execution is false
+        else if config.peak_prove_khz.is_some() && !orders.is_empty() {
             let peak_prove_khz = config.peak_prove_khz.unwrap();
             let total_commited_cycles = committed_orders
                 .iter()
@@ -861,6 +902,7 @@ where
                                 additional_proof_cycles: config.market.additional_proof_cycles,
                                 batch_buffer_time_secs: config.batcher.block_deadline_buffer_secs,
                                 order_commitment_priority: config.market.order_commitment_priority,
+                                skip_pre_execution: config.market.skip_pre_execution,
                             }
                         };
 
@@ -895,7 +937,7 @@ where
 
                         if !final_orders.is_empty() {
                             // Lock and prove filtered orders.
-                            self.lock_and_prove_orders(&final_orders).await?;
+                            self.lock_and_prove_orders(&final_orders, &monitor_config).await?;
                         }
                     }
                 }
@@ -1305,7 +1347,7 @@ pub(crate) mod tests {
             .await;
         let order_id = order.id();
 
-        ctx.monitor.lock_and_prove_orders(&[Arc::from(order)]).await.unwrap();
+        ctx.monitor.lock_and_prove_orders(&[Arc::from(order)], &OrderMonitorConfig::default()).await.unwrap();
 
         let updated_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
         assert_eq!(updated_order.status, OrderStatus::PendingProving);
@@ -1344,7 +1386,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let result = ctx.monitor.lock_and_prove_orders(&filtered_orders).await;
+        let result = ctx.monitor.lock_and_prove_orders(&filtered_orders, &OrderMonitorConfig::default()).await;
         assert!(result.is_ok(), "lock_and_prove_orders should succeed");
 
         // All orders should be processed since capacity is unlimited
@@ -1406,7 +1448,11 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        ctx.monitor.lock_and_prove_orders(&filtered_orders).await.unwrap();
+        ctx.monitor.lock_and_prove_orders(&filtered_orders, &OrderMonitorConfig {
+            max_concurrent_proofs: Some(3),
+            order_commitment_priority: OrderCommitmentPriority::ShortestExpiry,
+            ..Default::default()
+        }).await.unwrap();
 
         // Count processed orders
         let mut processed_count = 0;
@@ -1552,7 +1598,7 @@ pub(crate) mod tests {
             .apply_capacity_limits(orders, &OrderMonitorConfig::default(), &mut String::new())
             .await
             .unwrap();
-        let result = ctx.monitor.lock_and_prove_orders(&filtered_orders).await;
+        let result = ctx.monitor.lock_and_prove_orders(&filtered_orders, &OrderMonitorConfig::default()).await;
         assert!(result.is_ok(), "lock_and_prove_orders should succeed");
 
         // Verify both orders were processed correctly

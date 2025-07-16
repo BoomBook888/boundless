@@ -241,6 +241,13 @@ pub struct MarketConf {
     /// - "shortest_expiry": Process orders by shortest expiry first (lock expiry for lock-and-fulfill orders, request expiry for others)
     #[serde(default, alias = "expired_order_fulfillment_priority")]
     pub order_commitment_priority: OrderCommitmentPriority,
+    /// Skip pre-execution before locking orders
+    ///
+    /// If enabled, orders will be directly locked without pre-execution.
+    /// This can be useful in high-competition scenarios to lock orders faster,
+    /// but it might lead to accepting orders that cannot be fulfilled.
+    #[serde(default)]
+    pub skip_pre_execution: bool,
 }
 
 impl Default for MarketConf {
@@ -276,6 +283,7 @@ impl Default for MarketConf {
             max_concurrent_preflights: defaults::max_concurrent_preflights(),
             order_pricing_priority: OrderPricingPriority::default(),
             order_commitment_priority: OrderCommitmentPriority::default(),
+            skip_pre_execution: false,
         }
     }
 }

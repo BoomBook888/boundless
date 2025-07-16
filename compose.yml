@@ -61,6 +61,7 @@ x-broker-common: &broker-common
   build:
     context: .
     dockerfile: dockerfiles/broker.dockerfile
+    network: host
   mem_limit: 2G
   cpus: 2
   stop_grace_period: 3h
@@ -115,6 +116,7 @@ services:
   grafana:
     image: ${GRAFANA_IMG:-grafana/grafana:11.0.0}
     restart: unless-stopped
+    network_mode: host
     ports:
      - '3000:3000'
     environment:
@@ -127,6 +129,10 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-worker}
       - POSTGRES_PASS=${POSTGRES_PASSWORD:-password}
       - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
     volumes:
       - ./dockerfiles/grafana:/etc/grafana/provisioning/
       - grafana-data:/var/lib/grafana
