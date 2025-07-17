@@ -25,9 +25,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    block_scanner::BlockScanner,
     chain_monitor::ChainMonitorService,
     db::{DbError, DbObj},
     errors::{impl_coded_debug, CodedError},
+    order_cache::OrderCache,
     task::{RetryRes, RetryTask, SupervisorErr},
     FulfillmentType, OrderRequest,
 };
@@ -73,6 +75,7 @@ pub struct MarketMonitor<P> {
     order_stream: Option<OrderStreamClient>,
     new_order_tx: tokio::sync::mpsc::Sender<Box<OrderRequest>>,
     fulfillment_tx: tokio::sync::broadcast::Sender<U256>,
+    use_block_scanner: bool, // 新增：是否使用区块扫描器
 }
 
 sol! {
@@ -99,6 +102,7 @@ where
         order_stream: Option<OrderStreamClient>,
         new_order_tx: tokio::sync::mpsc::Sender<Box<OrderRequest>>,
         fulfillment_tx: tokio::sync::broadcast::Sender<U256>,
+        use_block_scanner: bool, // 新增：是否使用区块扫描器
     ) -> Self {
         Self {
             lookback_blocks,
@@ -110,6 +114,7 @@ where
             order_stream,
             new_order_tx,
             fulfillment_tx,
+            use_block_scanner,
         }
     }
 
@@ -520,6 +525,16 @@ where
         }
         Ok(())
     }
+
+    /// 创建新的区块扫描器
+    fn create_block_scanner(&self) -> BlockScanner<P> {
+        BlockScanner::new(
+            self.market_addr,
+            self.provider.clone(),
+            self.chain_monitor.clone(),
+            self.new_order_tx.clone(),
+        )
+    }
 }
 
 impl<P> RetryTask for MarketMonitor<P>
@@ -537,48 +552,94 @@ where
         let db = self.db.clone();
         let order_stream = self.order_stream.clone();
         let fulfillment_tx = self.fulfillment_tx.clone();
+        let use_block_scanner = self.use_block_scanner;
 
         Box::pin(async move {
-            tracing::info!("Starting up market monitor");
+            tracing::info!("启动市场监控");
 
             Self::find_open_orders(
                 lookback_blocks,
                 market_addr,
                 provider.clone(),
-                chain_monitor,
+                chain_monitor.clone(),
                 &new_order_tx,
             )
             .await
             .map_err(|err| {
-                tracing::error!("Monitor failed to find open orders on startup.");
+                tracing::error!("监控器在启动时无法找到开放订单");
                 SupervisorErr::Recover(err)
             })?;
 
-            tokio::try_join!(
-                Self::monitor_orders(
+            // 如果启用了区块扫描器，创建并启动它
+            if use_block_scanner {
+                tracing::info!("启用区块扫描器，每秒扫描最新的50个区块");
+                let block_scanner = BlockScanner::new(
                     market_addr,
                     provider.clone(),
+                    chain_monitor.clone(),
                     new_order_tx.clone(),
-                    cancel_token.clone()
-                ),
-                Self::monitor_order_fulfillments(
-                    market_addr,
-                    provider.clone(),
-                    db.clone(),
-                    fulfillment_tx,
-                    cancel_token.clone()
-                ),
-                Self::monitor_order_locks(
-                    market_addr,
-                    prover_addr,
-                    provider.clone(),
-                    db,
-                    new_order_tx,
-                    order_stream,
-                    cancel_token
+                );
+                
+                // 派生一个新的取消令牌，这样当主取消令牌被取消时，扫描器也会被取消
+                let scanner_token = cancel_token.child_token();
+                let scanner_handle = tokio::spawn(block_scanner.spawn(scanner_token));
+                
+                tokio::try_join!(
+                    Self::monitor_orders(
+                        market_addr,
+                        provider.clone(),
+                        new_order_tx.clone(),
+                        cancel_token.child_token()
+                    ),
+                    Self::monitor_order_fulfillments(
+                        market_addr,
+                        provider.clone(),
+                        db.clone(),
+                        fulfillment_tx,
+                        cancel_token.child_token()
+                    ),
+                    Self::monitor_order_locks(
+                        market_addr,
+                        prover_addr,
+                        provider.clone(),
+                        db,
+                        new_order_tx,
+                        order_stream,
+                        cancel_token.child_token()
+                    ),
                 )
-            )
-            .map_err(SupervisorErr::Recover)?;
+                .map_err(SupervisorErr::Recover)?;
+
+                // 等待扫描器终止，但忽略结果
+                let _ = scanner_handle.await;
+            } else {
+                // 原始代码路径（不使用区块扫描器）
+                tokio::try_join!(
+                    Self::monitor_orders(
+                        market_addr,
+                        provider.clone(),
+                        new_order_tx.clone(),
+                        cancel_token.clone()
+                    ),
+                    Self::monitor_order_fulfillments(
+                        market_addr,
+                        provider.clone(),
+                        db.clone(),
+                        fulfillment_tx,
+                        cancel_token.clone()
+                    ),
+                    Self::monitor_order_locks(
+                        market_addr,
+                        prover_addr,
+                        provider.clone(),
+                        db,
+                        new_order_tx,
+                        order_stream,
+                        cancel_token
+                    )
+                )
+                .map_err(SupervisorErr::Recover)?;
+            }
 
             Ok(())
         })
@@ -712,6 +773,7 @@ mod tests {
             None,
             order_tx,
             fulfillment_tx,
+            false,
         );
 
         let block_time = market_monitor.get_block_time().await.unwrap();

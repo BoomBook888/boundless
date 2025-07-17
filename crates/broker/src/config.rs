@@ -248,6 +248,17 @@ pub struct MarketConf {
     /// but it might lead to accepting orders that cannot be fulfilled.
     #[serde(default)]
     pub skip_pre_execution: bool,
+    
+    /// Enable block scanner for order discovery
+    /// 
+    /// If enabled, the broker will periodically scan the latest blocks for new orders,
+    /// in addition to using WebSocket subscription. This ensures that no orders are
+    /// missed due to WebSocket delays, and improves the chances of locking orders
+    /// before competitors.
+    /// 
+    /// When enabled, the scanner will check the latest 50 blocks every second.
+    #[serde(default)]
+    pub enable_block_scanner: bool,
 }
 
 impl Default for MarketConf {
@@ -284,6 +295,7 @@ impl Default for MarketConf {
             order_pricing_priority: OrderPricingPriority::default(),
             order_commitment_priority: OrderCommitmentPriority::default(),
             skip_pre_execution: false,
+            enable_block_scanner: false,
         }
     }
 }

@@ -38,6 +38,7 @@ const NEW_ORDER_CHANNEL_CAPACITY: usize = 1000;
 const PRICING_CHANNEL_CAPACITY: usize = 1000;
 
 pub(crate) mod aggregator;
+pub(crate) mod block_scanner; // 新增：区块扫描器模块
 pub(crate) mod chain_monitor;
 pub mod config;
 pub(crate) mod db;
@@ -45,6 +46,7 @@ pub(crate) mod errors;
 pub mod futures_retry;
 pub(crate) mod market_monitor;
 pub(crate) mod offchain_market_monitor;
+pub(crate) mod order_cache; // 新增：订单缓存模块
 pub(crate) mod order_monitor;
 pub(crate) mod order_picker;
 pub(crate) mod prioritization;
@@ -665,6 +667,7 @@ where
             client.clone(),
             new_order_tx.clone(),
             fulfillment_tx.clone(),
+            config.lock_all().context("Failed to read config")?.market.enable_block_scanner,
         ));
 
         let block_times =
