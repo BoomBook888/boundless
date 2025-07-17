@@ -23,8 +23,8 @@ x-agent-common: &agent-common
 
 x-exec-agent-common: &exec-agent-common
   <<: *agent-common
-  mem_limit: 4G
-  cpus: 3
+  mem_limit: 6G  # 增加内存以支持更大工作负载
+  cpus: 4        # 增加CPU核心数
   environment:
     <<: *base-environment
     RISC0_KECCAK_PO2: ${RISC0_KECCAK_PO2:-17}
@@ -51,8 +51,13 @@ x-broker-common: &broker-common
   depends_on:
     - rest_api
     - gpu_prove_agent0
+    - gpu_prove_agent1
+    - gpu_prove_agent2
+    - gpu_prove_agent3
+    - gpu_prove_agent4  # 新增第5个GPU agent依赖
     - exec_agent0
     - exec_agent1
+    - exec_agent2       # 新增第3个exec agent
     - aux_agent
     - snark_agent
     - redis
@@ -61,8 +66,8 @@ x-broker-common: &broker-common
   build:
     context: .
     dockerfile: dockerfiles/broker.dockerfile
-  mem_limit: 2G
-  cpus: 2
+  mem_limit: 36G  # 增加broker内存以处理更多GPU的负载
+  cpus: 12        # 增加CPU以支持更高并发
   stop_grace_period: 3h
   network_mode: host
 
@@ -75,6 +80,8 @@ services:
       - 6379:6379
     volumes:
       - redis-data:/data
+    # Redis优化配置
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
 
   postgres:
     hostname: ${POSTGRES_HOST:-postgres}
@@ -91,6 +98,9 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     command: -p ${POSTGRES_PORT:-5432}
+    # PostgreSQL优化
+    mem_limit: 4G
+    cpus: 2
 
   minio:
     hostname: ${MINIO_HOST:-minio}
@@ -111,6 +121,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    mem_limit: 2G
+    cpus: 2
 
   grafana:
     image: ${GRAFANA_IMG:-grafana/grafana:11.0.0}
@@ -135,39 +147,117 @@ services:
       - postgres
       - redis
       - minio
+    mem_limit: 1G
+    cpus: 1
 
+  # 3个执行代理匹配5个GPU的工作负载
   exec_agent0:
     <<: *exec-agent-common
 
   exec_agent1:
     <<: *exec-agent-common
 
+  exec_agent2:
+    <<: *exec-agent-common
+
   aux_agent:
     <<: *agent-common
-    mem_limit: 256M
-    cpus: 1
+    mem_limit: 2G  # 稍微增加内存
+    cpus: 2          # 增加CPU
 
     entrypoint: /app/agent -t aux --monitor-requeue
 
+  # 5个GPU Prove Agent，每个绑定到专用RTX 4090
   gpu_prove_agent0:
     <<: *agent-common
-    mem_limit: 4G
-    cpus: 4
+    mem_limit: 18G  # RTX 4090优化：24GB VRAM配套的系统内存
+    cpus: 6         # 为高性能GPU分配更多CPU核心
     entrypoint: /app/agent -t prove
-
-    # comment-out if running in CPU proving mode
+    environment:
+      <<: *base-environment
+      CUDA_VISIBLE_DEVICES: "0"
+      NVIDIA_VISIBLE_DEVICES: "0"
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              # TODO: how to scale this with N gpus?
               device_ids: ['0']
+              capabilities: [gpu]
+
+  gpu_prove_agent1:
+    <<: *agent-common
+    mem_limit: 18G  # RTX 4090优化：24GB VRAM配套的系统内存
+    cpus: 6         # 为高性能GPU分配更多CPU核心
+    entrypoint: /app/agent -t prove
+    environment:
+      <<: *base-environment
+      CUDA_VISIBLE_DEVICES: "1"
+      NVIDIA_VISIBLE_DEVICES: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+
+  gpu_prove_agent2:
+    <<: *agent-common
+    mem_limit: 18G  # RTX 4090优化：24GB VRAM配套的系统内存
+    cpus: 6         # 为高性能GPU分配更多CPU核心
+    entrypoint: /app/agent -t prove
+    environment:
+      <<: *base-environment
+      CUDA_VISIBLE_DEVICES: "2"
+      NVIDIA_VISIBLE_DEVICES: "2"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']
+              capabilities: [gpu]
+
+  gpu_prove_agent3:
+    <<: *agent-common
+    mem_limit: 18G  # RTX 4090优化：24GB VRAM配套的系统内存
+    cpus: 6         # 为高性能GPU分配更多CPU核心
+    entrypoint: /app/agent -t prove
+    environment:
+      <<: *base-environment
+      CUDA_VISIBLE_DEVICES: "3"
+      NVIDIA_VISIBLE_DEVICES: "3"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['3']
+              capabilities: [gpu]
+
+  gpu_prove_agent4:
+    <<: *agent-common
+    mem_limit: 18G  # RTX 4090优化：24GB VRAM配套的系统内存
+    cpus: 6         # 为高性能GPU分配更多CPU核心
+    entrypoint: /app/agent -t prove
+    environment:
+      <<: *base-environment
+      CUDA_VISIBLE_DEVICES: "4"
+      NVIDIA_VISIBLE_DEVICES: "4"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['4']
               capabilities: [gpu]
 
   snark_agent:
     <<: *agent-common
     entrypoint: /app/agent -t snark
+    mem_limit: 2G  # 增加内存以支持更大工作负载
+    cpus: 2
 
     ulimits:
       # Needed for stark_verify bin
@@ -181,8 +271,8 @@ services:
       - postgres
       - minio
 
-    mem_limit: 1G
-    cpus: 1
+    mem_limit: 3G  # 增加内存以处理更高负载
+    cpus: 2        # 增加CPU核心
 
     environment:
       <<: *base-environment
@@ -199,20 +289,13 @@ services:
         source: ./broker.toml
         target: /app/broker.toml
       - broker-data:/db/
-      # Uncomment when using locally built set-builder and assessor guest programs
-      # - type: bind
-      #   source: ./target/riscv-guest/guest-set-builder/set-builder/riscv32im-risc0-zkvm-elf/release/set-builder.bin
-      #   target: /target/riscv-guest/guest-set-builder/set-builder/riscv32im-risc0-zkvm-elf/release/set-builder.bin
-      # - type: bind
-      #   source: ./target/riscv-guest/guest-assessor/assessor-guest/riscv32im-risc0-zkvm-elf/release/assessor-guest.bin
-      #   target: /target/riscv-guest/guest-assessor/assessor-guest/riscv32im-risc0-zkvm-elf/release/assessor-guest.bin
     environment:
       <<: *broker-environment
       PRIVATE_KEY: ${PRIVATE_KEY}
       RPC_URL: ${RPC_URL}
     entrypoint: /app/broker --db-url 'sqlite:///db/broker.db' --config-file /app/broker.toml --bento-api-url http://localhost:8081
 
-  # # Example second broker with different configuration
+  # # 示例：第二个broker配置（可选）
   # broker2:
   #   <<: *broker-common
   #   volumes:
@@ -222,7 +305,7 @@ services:
   #     - broker2-data:/db/
   #   environment:
   #     <<: *broker-environment
-  #     # Note: use a different variable if you want to use different private keys in each broker
+  #     # 注意：如果想在每个broker中使用不同的私钥，请使用不同的变量
   #     PRIVATE_KEY: ${PRIVATE_KEY}
   #     RPC_URL: ${RPC_URL_2}
   #   entrypoint: /app/broker --db-url 'sqlite:///db/broker2.db' --config-file /app/broker.toml --bento-api-url http://localhost:8081
@@ -233,4 +316,4 @@ volumes:
   minio-data:
   grafana-data:
   broker-data:
-  # broker2-data:
+  # broker2-data: 
